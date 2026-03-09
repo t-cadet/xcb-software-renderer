@@ -1,4 +1,4 @@
-// gcc -std=c23 -O0 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -o main
+// gcc -std=c23 -O0 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -o main
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -25,9 +25,11 @@
 
 const char* DRI3_EXTENSION_NAME = "DRI3";
 const char* PRESENT_EXTENSION_NAME = "Present";
+const char* RENDER_EXTENSION_NAME = "RENDER";
 
 uint8_t DRI3_MAJOR_OPCODE = 0;
 uint8_t PRESENT_MAJOR_OPCODE = 0;
+uint8_t RENDER_MAJOR_OPCODE = 0;
 
 #define DIE(connection, message) die(connection, message, __FILE__, __LINE__)
 void die(xcb_connection_t *connection, const char *message, const char* file, int line) {
@@ -124,6 +126,7 @@ const char* xcb_major_code_to_string(uint8_t major_code) {
     default: {
       if (major_code == DRI3_MAJOR_OPCODE) return DRI3_EXTENSION_NAME;
       else if (major_code == PRESENT_MAJOR_OPCODE) return PRESENT_EXTENSION_NAME;
+      else if (major_code == RENDER_MAJOR_OPCODE) return RENDER_EXTENSION_NAME;
       return "Unknown";
     }
   }
@@ -149,9 +152,23 @@ const char* xcb_present_minor_code_to_string(uint8_t minor_code) {
   }
 }
 
+const char* xcb_render_minor_code_to_string(uint8_t minor_code) {
+  // render.h
+  switch (minor_code) {
+    case XCB_RENDER_QUERY_VERSION:      return "QueryVersion";
+    case XCB_RENDER_QUERY_PICT_FORMATS: return "QueryPictFormats";
+    case XCB_RENDER_CREATE_PICTURE:     return "CreatePicture";
+    case XCB_RENDER_FREE_PICTURE:       return "FreePicture";
+    case XCB_RENDER_CREATE_CURSOR:      return "CreateCursor";
+    case XCB_RENDER_CREATE_ANIM_CURSOR: return "CreateAnimCursor";
+    default: return "Unknown";
+  }
+}
+
 const char* xcb_minor_code_to_string(uint8_t major_code, uint8_t minor_code) {
   if (major_code == DRI3_MAJOR_OPCODE) return xcb_dri3_minor_code_to_string(minor_code);
   if (major_code == PRESENT_MAJOR_OPCODE) return xcb_present_minor_code_to_string(minor_code);
+  if (major_code == RENDER_MAJOR_OPCODE) return xcb_render_minor_code_to_string(minor_code);
   return "";
 }
 
@@ -216,6 +233,9 @@ int main() {
     cursors[cursor_index] = xcb_cursor_load_cursor(cursor_context, get_cursor_name(cursor_index));
     if (!cursors[cursor_index]) DIE(connection, "xcb_cursor_load_cursor");
   }
+  const xcb_query_extension_reply_t *query_extension_render_reply = xcb_get_extension_data(connection, &xcb_render_id);
+  if (!query_extension_render_reply) DIE(connection, "xcb_get_extension_data: render");
+  RENDER_MAJOR_OPCODE = query_extension_render_reply->major_opcode;
   xcb_cursor_context_free(cursor_context);
 
   // Create window
