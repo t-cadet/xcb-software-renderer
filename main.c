@@ -181,6 +181,206 @@ void xcb_print_error(xcb_generic_error_t *error) {
           error->major_code, error->minor_code, error->error_code);
 }
 
+void xcb_print_event(const xcb_generic_event_t *event) {
+  if (!event) {
+    fprintf(stderr, "[XCB_EVENT] NULL event\n");
+    return;
+  }
+
+  uint8_t type      = event->response_type & 0x7F;
+  int     synthetic = (event->response_type & 0x80) != 0;
+
+  switch (type) {
+    case XCB_KEY_PRESS:
+    case XCB_KEY_RELEASE: {
+      const xcb_key_press_event_t *e = (const xcb_key_press_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] %s synthetic=%d time=%u keycode=%u state=0x%04X"
+                      " win=0x%08X root_xy=(%d,%d) event_xy=(%d,%d)\n",
+              type == XCB_KEY_PRESS ? "KeyPress" : "KeyRelease",
+              synthetic, e->time, e->detail, e->state,
+              e->event, e->root_x, e->root_y, e->event_x, e->event_y);
+    } break;
+    case XCB_BUTTON_PRESS:
+    case XCB_BUTTON_RELEASE: {
+      const xcb_button_press_event_t *e = (const xcb_button_press_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] %s synthetic=%d time=%u button=%u state=0x%04X"
+                      " win=0x%08X root_xy=(%d,%d) event_xy=(%d,%d)\n",
+              type == XCB_BUTTON_PRESS ? "ButtonPress" : "ButtonRelease",
+              synthetic, e->time, e->detail, e->state,
+              e->event, e->root_x, e->root_y, e->event_x, e->event_y);
+    } break;
+    case XCB_MOTION_NOTIFY: {
+      const xcb_motion_notify_event_t *e = (const xcb_motion_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] MotionNotify synthetic=%d time=%u hint=%d"
+                      " state=0x%04X win=0x%08X event_xy=(%d,%d)\n",
+              synthetic, e->time, e->detail, e->state,
+              e->event, e->event_x, e->event_y);
+    } break;
+    case XCB_ENTER_NOTIFY:
+    case XCB_LEAVE_NOTIFY: {
+      const xcb_enter_notify_event_t *e = (const xcb_enter_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] %s synthetic=%d time=%u mode=%d detail=%d"
+                      " win=0x%08X child=0x%08X event_xy=(%d,%d)\n",
+              type == XCB_ENTER_NOTIFY ? "EnterNotify" : "LeaveNotify",
+              synthetic, e->time, e->mode, e->detail,
+              e->event, e->child, e->event_x, e->event_y);
+    } break;
+    case XCB_FOCUS_IN:
+    case XCB_FOCUS_OUT: {
+      const xcb_focus_in_event_t *e = (const xcb_focus_in_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] %s synthetic=%d mode=%d detail=%d win=0x%08X\n",
+              type == XCB_FOCUS_IN ? "FocusIn" : "FocusOut",
+              synthetic, e->mode, e->detail, e->event);
+    } break;
+    case XCB_KEYMAP_NOTIFY: {
+      const xcb_keymap_notify_event_t *e = (const xcb_keymap_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] KeymapNotify synthetic=%d keys[0]=0x%02X ...\n",
+              synthetic, e->keys[0]);
+    } break;
+    case XCB_EXPOSE: {
+      const xcb_expose_event_t *e = (const xcb_expose_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] Expose synthetic=%d win=0x%08X"
+                      " xy=(%d,%d) wh=(%d,%d) count=%d\n",
+              synthetic, e->window, e->x, e->y, e->width, e->height, e->count);
+    } break;
+    case XCB_GRAPHICS_EXPOSURE: {
+      const xcb_graphics_exposure_event_t *e = (const xcb_graphics_exposure_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] GraphicsExpose synthetic=%d drawable=0x%08X"
+                      " xy=(%d,%d) wh=(%d,%d) count=%d\n",
+              synthetic, e->drawable, e->x, e->y, e->width, e->height, e->count);
+    } break;
+    case XCB_NO_EXPOSURE: {
+      const xcb_no_exposure_event_t *e = (const xcb_no_exposure_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] NoExpose synthetic=%d drawable=0x%08X minor=%u major=%u\n",
+              synthetic, e->drawable, e->minor_opcode, e->major_opcode);
+    } break;
+    case XCB_VISIBILITY_NOTIFY: {
+      const xcb_visibility_notify_event_t *e = (const xcb_visibility_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] VisibilityNotify synthetic=%d win=0x%08X state=%d\n",
+              synthetic, e->window, e->state);
+    } break;
+    case XCB_CREATE_NOTIFY: {
+      const xcb_create_notify_event_t *e = (const xcb_create_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] CreateNotify synthetic=%d parent=0x%08X win=0x%08X"
+                      " xy=(%d,%d) wh=(%d,%d) border=%d\n",
+              synthetic, e->parent, e->window,
+              e->x, e->y, e->width, e->height, e->border_width);
+    } break;
+    case XCB_DESTROY_NOTIFY: {
+      const xcb_destroy_notify_event_t *e = (const xcb_destroy_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] DestroyNotify synthetic=%d event=0x%08X win=0x%08X\n",
+              synthetic, e->event, e->window);
+    } break;
+    case XCB_UNMAP_NOTIFY: {
+      const xcb_unmap_notify_event_t *e = (const xcb_unmap_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] UnmapNotify synthetic=%d event=0x%08X win=0x%08X"
+                      " from_configure=%d\n",
+              synthetic, e->event, e->window, e->from_configure);
+    } break;
+    case XCB_MAP_NOTIFY: {
+      const xcb_map_notify_event_t *e = (const xcb_map_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] MapNotify synthetic=%d event=0x%08X win=0x%08X"
+                      " override_redirect=%d\n",
+              synthetic, e->event, e->window, e->override_redirect);
+    } break;
+    case XCB_MAP_REQUEST: {
+      const xcb_map_request_event_t *e = (const xcb_map_request_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] MapRequest synthetic=%d parent=0x%08X win=0x%08X\n",
+              synthetic, e->parent, e->window);
+    } break;
+    case XCB_REPARENT_NOTIFY: {
+      const xcb_reparent_notify_event_t *e = (const xcb_reparent_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] ReparentNotify synthetic=%d event=0x%08X win=0x%08X"
+                      " parent=0x%08X xy=(%d,%d)\n",
+              synthetic, e->event, e->window, e->parent, e->x, e->y);
+    } break;
+    case XCB_CONFIGURE_NOTIFY: {
+      const xcb_configure_notify_event_t *e = (const xcb_configure_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] ConfigureNotify synthetic=%d win=0x%08X"
+                      " xy=(%d,%d) wh=(%d,%d) border=%d above=0x%08X\n",
+              synthetic, e->window,
+              e->x, e->y, e->width, e->height, e->border_width, e->above_sibling);
+    } break;
+    case XCB_CONFIGURE_REQUEST: {
+      const xcb_configure_request_event_t *e = (const xcb_configure_request_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] ConfigureRequest synthetic=%d win=0x%08X"
+                      " xy=(%d,%d) wh=(%d,%d) border=%d mask=0x%04X\n",
+              synthetic, e->window,
+              e->x, e->y, e->width, e->height, e->border_width, e->value_mask);
+    } break;
+    case XCB_GRAVITY_NOTIFY: {
+      const xcb_gravity_notify_event_t *e = (const xcb_gravity_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] GravityNotify synthetic=%d event=0x%08X win=0x%08X"
+                      " xy=(%d,%d)\n",
+              synthetic, e->event, e->window, e->x, e->y);
+    } break;
+    case XCB_RESIZE_REQUEST: {
+      const xcb_resize_request_event_t *e = (const xcb_resize_request_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] ResizeRequest synthetic=%d win=0x%08X wh=(%d,%d)\n",
+              synthetic, e->window, e->width, e->height);
+    } break;
+    case XCB_CIRCULATE_NOTIFY: {
+      const xcb_circulate_notify_event_t *e = (const xcb_circulate_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] CirculateNotify synthetic=%d event=0x%08X win=0x%08X"
+                      " place=%d\n",
+              synthetic, e->event, e->window, e->place);
+    } break;
+    case XCB_CIRCULATE_REQUEST: {
+      const xcb_circulate_request_event_t *e = (const xcb_circulate_request_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] CirculateRequest synthetic=%d event=0x%08X win=0x%08X"
+                      " place=%d\n",
+              synthetic, e->event, e->window, e->place);
+    } break;
+    case XCB_PROPERTY_NOTIFY: {
+      const xcb_property_notify_event_t *e = (const xcb_property_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] PropertyNotify synthetic=%d win=0x%08X"
+                      " atom=%u state=%d time=%u\n",
+              synthetic, e->window, e->atom, e->state, e->time);
+    } break;
+    case XCB_SELECTION_CLEAR: {
+      const xcb_selection_clear_event_t *e = (const xcb_selection_clear_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] SelectionClear synthetic=%d owner=0x%08X"
+                      " selection=%u time=%u\n",
+              synthetic, e->owner, e->selection, e->time);
+    } break;
+    case XCB_SELECTION_REQUEST: {
+      const xcb_selection_request_event_t *e = (const xcb_selection_request_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] SelectionRequest synthetic=%d owner=0x%08X"
+                      " requestor=0x%08X selection=%u target=%u property=%u time=%u\n",
+              synthetic, e->owner, e->requestor,
+              e->selection, e->target, e->property, e->time);
+    } break;
+    case XCB_SELECTION_NOTIFY: {
+      const xcb_selection_notify_event_t *e = (const xcb_selection_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] SelectionNotify synthetic=%d requestor=0x%08X"
+                      " selection=%u target=%u property=%u time=%u\n",
+              synthetic, e->requestor,
+              e->selection, e->target, e->property, e->time);
+    } break;
+    case XCB_COLORMAP_NOTIFY: {
+      const xcb_colormap_notify_event_t *e = (const xcb_colormap_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] ColormapNotify synthetic=%d win=0x%08X"
+                      " colormap=%u new=%d state=%d\n",
+              synthetic, e->window, e->colormap, e->_new, e->state);
+    } break;
+    case XCB_CLIENT_MESSAGE: {
+      const xcb_client_message_event_t *e = (const xcb_client_message_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] ClientMessage synthetic=%d win=0x%08X"
+                      " type=%u format=%d data[0]=0x%08X\n",
+              synthetic, e->window, e->type, e->format, e->data.data32[0]);
+    } break;
+    case XCB_MAPPING_NOTIFY: {
+      const xcb_mapping_notify_event_t *e = (const xcb_mapping_notify_event_t *)event;
+      fprintf(stderr, "[XCB_EVENT] MappingNotify synthetic=%d request=%d"
+                      " first_keycode=%u count=%u\n",
+              synthetic, e->request, e->first_keycode, e->count);
+    } break;
+    default: {
+      fprintf(stderr, "[XCB_EVENT] Unknown type=%d synthetic=%d\n", type, synthetic);
+    } break;
+  }
+}
+
 int main() {
   App app = {0};
   
@@ -248,14 +448,24 @@ int main() {
   uint32_t value_mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_CURSOR;
   xcb_create_window_value_list_t value_list = {0};
   value_list.background_pixel = screen->black_pixel;
-  // TODO: more events
-  value_list.event_mask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS;
+  value_list.event_mask = XCB_EVENT_MASK_KEY_PRESS
+                        | XCB_EVENT_MASK_KEY_RELEASE
+                        | XCB_EVENT_MASK_BUTTON_PRESS
+                        | XCB_EVENT_MASK_BUTTON_RELEASE
+                        // | XCB_EVENT_MASK_ENTER_WINDOW
+                        // | XCB_EVENT_MASK_LEAVE_WINDOW
+                        | XCB_EVENT_MASK_POINTER_MOTION
+                        // | XCB_EVENT_MASK_KEYMAP_STATE
+                        | XCB_EVENT_MASK_VISIBILITY_CHANGE
+                        | XCB_EVENT_MASK_STRUCTURE_NOTIFY
+                        // | XCB_EVENT_MASK_RESIZE_REDIRECT
+                        // | XCB_EVENT_MASK_FOCUS_CHANGE
+                        ;
   value_list.cursor = cursors[app.cursor];
   if (visual != screen->root_visual) {
     value_mask |= XCB_CW_BORDER_PIXEL | XCB_CW_COLORMAP;
     value_list.border_pixel = screen->black_pixel;
     value_list.colormap = xcb_generate_id(connection);
-    // TODO: check these args
     xcb_create_colormap(connection, XCB_COLORMAP_ALLOC_NONE, value_list.colormap, screen->root, visual);
   }
   xcb_window_t window = xcb_generate_id(connection);
@@ -267,6 +477,7 @@ int main() {
   xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, format, strlen(title), title);
 
   // TODO: register atom to close window
+  // TODO: set icon
 
   // Retrieve extension major opcode
   // TODO: factor code
@@ -372,7 +583,7 @@ int main() {
           xcb_generic_error_t *error = (xcb_generic_error_t *)ev;
           xcb_print_error(error);
         } else {
-          fprintf(stderr, "XCB event: type=%d\n", ev->response_type & ~0x80);
+          xcb_print_event(ev);
         }
         free(ev);
       }
@@ -406,6 +617,7 @@ int main() {
   pause();
 #endif
   
+  // TODO: create context and pass it to `DIE` to free everything
   for (int i = 0; i < BUFFER_COUNT; ++i) {
     if (buffers[i]) munmap(buffers[i], size);
   }
