@@ -381,6 +381,33 @@ void xcb_print_event(const xcb_generic_event_t *event) {
   }
 }
 
+#define XCB_INTERN_ATOM_REPLY_OR_DIE(connection, cookie) xcb_intern_atom_reply_or_die(connection, cookie, #cookie, __FILE__, __LINE__)
+xcb_atom_t xcb_intern_atom_reply_or_die(xcb_connection_t *connection, xcb_intern_atom_cookie_t cookie, const char* die_message, const char* file, int line) {
+  xcb_generic_error_t *error = NULL;
+  xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(connection, cookie, &error);
+  if (error) {
+    xcb_print_error(error);
+    free(error);
+    die(connection, die_message, file, line);
+  }
+  if (!reply) die(connection, die_message, file, line);
+  xcb_atom_t atom = reply->atom;
+  return atom;
+}
+
+#define XCB_QUERY_EXTENSION_REPLY_OR_DIE(connection, cookie) xcb_query_extension_reply_or_die(connection, cookie, #cookie, __FILE__, __LINE__)
+xcb_query_extension_reply_t* xcb_query_extension_reply_or_die(xcb_connection_t *connection, xcb_query_extension_cookie_t cookie, const char* die_message, const char* file, int line) {
+  xcb_generic_error_t *error = NULL;
+  xcb_query_extension_reply_t *reply = xcb_query_extension_reply(connection, cookie, &error);
+  if (error) {
+    xcb_print_error(error);
+    free(error);
+    die(connection, die_message, file, line);
+  }
+  if (!reply) die(connection, die_message, file, line);
+  return reply;
+}
+
 int main() {
   App app = {0};
   
@@ -393,6 +420,12 @@ int main() {
   // Prefetch extension data (no need to check extension versions as we only use v1.0 requests)
   xcb_query_extension_cookie_t query_extension_dri3_cookie = xcb_query_extension(connection, strlen(DRI3_EXTENSION_NAME), DRI3_EXTENSION_NAME);
   xcb_query_extension_cookie_t query_extension_present_cookie = xcb_query_extension(connection, strlen(PRESENT_EXTENSION_NAME), PRESENT_EXTENSION_NAME);
+
+  // Prefetch atoms
+  bool only_if_exists = false;
+  xcb_intern_atom_cookie_t wm_protocols_cookie = xcb_intern_atom(connection, only_if_exists, strlen("WM_PROTOCOLS"), "WM_PROTOCOLS");
+  xcb_intern_atom_cookie_t wm_delete_window_cookie = xcb_intern_atom(connection, only_if_exists, strlen("WM_DELETE_WINDOW"), "WM_DELETE_WINDOW");
+
   xcb_flush(connection);
 
   // Find preferred screen
@@ -475,31 +508,18 @@ int main() {
   const char* title = "XCB Software Renderer";
   uint8_t format = 8;
   xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, format, strlen(title), title);
+  xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_ICON_NAME, XCB_ATOM_STRING, format, strlen(title), title);
 
-  // TODO: register atom to close window
+  // Retrieve atoms & handle window closing
+  xcb_atom_t wm_protocols = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_protocols_cookie);
+  xcb_atom_t wm_delete_window = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_delete_window_cookie);
+  xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, wm_protocols, XCB_ATOM_ATOM, sizeof(wm_delete_window)*8, 1, &wm_delete_window);
+
   // TODO: set icon
 
   // Retrieve extension major opcode
-  // TODO: factor code
-  xcb_generic_error_t *query_extension_dri3_error = NULL;
-  xcb_generic_error_t *query_extension_present_error = NULL;
-
-  xcb_query_extension_reply_t *query_extension_dri3_reply = xcb_query_extension_reply(connection, query_extension_dri3_cookie, &query_extension_dri3_error);
-  xcb_query_extension_reply_t *query_extension_present_reply = xcb_query_extension_reply(connection, query_extension_present_cookie, &query_extension_present_error);
-
-  if (query_extension_dri3_error) {
-    xcb_print_error(query_extension_dri3_error);
-    free(query_extension_dri3_error);
-    DIE(connection, "query_extension_dri3_error");
-  }
-  if (query_extension_present_error) {
-    xcb_print_error(query_extension_present_error);
-    free(query_extension_present_error);
-    DIE(connection, "query_extension_present_error");
-  }
-
-  if (!query_extension_dri3_reply) DIE(connection, "query_extension_dri3_reply: null reply");
-  if (!query_extension_present_reply) DIE(connection, "query_extension_present_reply: null reply");
+  xcb_query_extension_reply_t *query_extension_dri3_reply = XCB_QUERY_EXTENSION_REPLY_OR_DIE(connection, query_extension_dri3_cookie);
+  xcb_query_extension_reply_t *query_extension_present_reply = XCB_QUERY_EXTENSION_REPLY_OR_DIE(connection, query_extension_present_cookie);
 
   if (!query_extension_dri3_reply->present) DIE(connection, "DRI3 extension is not available");
   if (!query_extension_present_reply->present) DIE(connection, "Present extension is not available");
@@ -584,6 +604,15 @@ int main() {
           xcb_print_error(error);
         } else {
           xcb_print_event(ev);
+          switch (ev->response_type & 0x7F) {
+            case XCB_CLIENT_MESSAGE: {
+              const xcb_client_message_event_t *e = (const xcb_client_message_event_t *)ev;
+              if (e->type == wm_protocols && e->data.data32[0] == wm_delete_window) {
+                  fprintf(stderr, "Received WM_DELETE_WINDOW, quitting...\n");
+                  quit = true;
+              }
+            } break;
+          }
         }
         free(ev);
       }
