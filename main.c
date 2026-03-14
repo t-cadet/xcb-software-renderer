@@ -392,11 +392,12 @@ xcb_atom_t xcb_intern_atom_reply_or_die(xcb_connection_t *connection, xcb_intern
   }
   if (!reply) die(connection, die_message, file, line);
   xcb_atom_t atom = reply->atom;
+  free(reply);
   return atom;
 }
 
-#define XCB_QUERY_EXTENSION_REPLY_OR_DIE(connection, cookie) xcb_query_extension_reply_or_die(connection, cookie, #cookie, __FILE__, __LINE__)
-xcb_query_extension_reply_t* xcb_query_extension_reply_or_die(xcb_connection_t *connection, xcb_query_extension_cookie_t cookie, const char* die_message, const char* file, int line) {
+#define XCB_QUERY_EXTENSION_MAJOR_OPCODE_OR_DIE(connection, cookie) xcb_query_extension_reply_or_die(connection, cookie, #cookie, __FILE__, __LINE__)
+uint8_t xcb_query_extension_reply_or_die(xcb_connection_t *connection, xcb_query_extension_cookie_t cookie, const char* die_message, const char* file, int line) {
   xcb_generic_error_t *error = NULL;
   xcb_query_extension_reply_t *reply = xcb_query_extension_reply(connection, cookie, &error);
   if (error) {
@@ -405,7 +406,10 @@ xcb_query_extension_reply_t* xcb_query_extension_reply_or_die(xcb_connection_t *
     die(connection, die_message, file, line);
   }
   if (!reply) die(connection, die_message, file, line);
-  return reply;
+  if (!reply->present) die(connection, die_message, file, line);
+  uint8_t major_opcode = reply->major_opcode;
+  free(reply);
+  return major_opcode;
 }
 
 int main() {
@@ -515,136 +519,149 @@ int main() {
   xcb_atom_t wm_delete_window = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_delete_window_cookie);
   xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, wm_protocols, XCB_ATOM_ATOM, sizeof(wm_delete_window)*8, 1, &wm_delete_window);
 
-  // TODO: set icon
-
   // Retrieve extension major opcode
-  xcb_query_extension_reply_t *query_extension_dri3_reply = XCB_QUERY_EXTENSION_REPLY_OR_DIE(connection, query_extension_dri3_cookie);
-  xcb_query_extension_reply_t *query_extension_present_reply = XCB_QUERY_EXTENSION_REPLY_OR_DIE(connection, query_extension_present_cookie);
-
-  if (!query_extension_dri3_reply->present) DIE(connection, "DRI3 extension is not available");
-  if (!query_extension_present_reply->present) DIE(connection, "Present extension is not available");
-
-  DRI3_MAJOR_OPCODE = query_extension_dri3_reply->major_opcode;
-  PRESENT_MAJOR_OPCODE = query_extension_present_reply->major_opcode;
+  DRI3_MAJOR_OPCODE = XCB_QUERY_EXTENSION_MAJOR_OPCODE_OR_DIE(connection, query_extension_dri3_cookie);
+  PRESENT_MAJOR_OPCODE = XCB_QUERY_EXTENSION_MAJOR_OPCODE_OR_DIE(connection, query_extension_present_cookie);
 
   // Create buffers
   int stride = (screen->width_in_pixels * 4 + 63) & ~63;
   int size = stride * screen->height_in_pixels;
 
   int udmabuf_device = open("/dev/udmabuf", O_RDWR);
-  if (udmabuf_device < 0) DIE(connection, "cannot open udmabuf device");
+  if (udmabuf_device < 0) DIE(connection, strerror(errno));
 
   uint32_t *buffers[BUFFER_COUNT] = {0};
+  int udmabufs[BUFFER_COUNT] = {0};
   xcb_pixmap_t pixmaps[BUFFER_COUNT] = {0};
 
   for (int i = 0; i < BUFFER_COUNT; ++i) {
     int memfd = memfd_create("buffer", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    ftruncate(memfd, size);
-    fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK);
+    if (memfd < 0) DIE(connection, strerror(errno));
+
+    if (ftruncate(memfd, size) < 0)
+      DIE(connection, strerror(errno));
+
+    if (fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) == -1)
+      DIE(connection, strerror(errno));
 
     buffers[i] = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    if (buffers[i] < 0) DIE(connection, strerror(errno));
     memset(buffers[i], 0, size);
 
     struct udmabuf_create create = {0};
     create.memfd = memfd;
     create.size = size;
     create.flags = UDMABUF_FLAGS_CLOEXEC;
-    int udmabuf = ioctl(udmabuf_device, UDMABUF_CREATE, &create);
+    udmabufs[i] = ioctl(udmabuf_device, UDMABUF_CREATE, &create);
+    if (udmabufs[i] == -1) DIE(connection, strerror(errno));
 
     uint8_t bpp = 32;
     pixmaps[i] = xcb_generate_id(connection);
-    xcb_dri3_pixmap_from_buffer(connection, pixmaps[i], window, size, screen->width_in_pixels, screen->height_in_pixels, stride, depth, bpp, udmabuf);
+    xcb_dri3_pixmap_from_buffer(connection, pixmaps[i], window, size, screen->width_in_pixels, screen->height_in_pixels, stride, depth, bpp, udmabufs[i]);
 
-    // close(udmabuf);
-    // close(memfd);
+    close(memfd);
   }
 
   close(udmabuf_device);
 
+  // Special event queue for Present events
   xcb_present_event_t present_event = xcb_generate_id(connection);
   xcb_present_select_input(connection, present_event, window, XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY);
   xcb_special_event_t *special_event = xcb_register_for_special_xge(connection, &xcb_present_id, present_event, NULL);
+  if (!special_event) DIE(connection, "xcb_register_for_special_xge");
 
+  // Show window
   xcb_map_window(connection, window);
 
-  // TODO: window CreateNotify event
-  // TODO: MapNotify event
-  // TODO: correctly position image based on x, y, w, h
-  // TODO: handle resize
-  // TODO?: avoid flicker first frame by rendering once
+  // App outputs
+  Cursor cursor = app.cursor;
 
+  // Event loop state
   bool quit = false;
   int current_buffer = 0;
   uint32_t frame_count = 0;
 
-  Cursor cursor = app.cursor;
+  // TODO: correctly position image based on x, y, w, h
+  // TODO: handle resize
 
-#if 1
   while (!quit) {
-    // TODO: poll xcb_connection_has_error
+    int xcb_connection_error_code = xcb_connection_has_error(connection);
+    if (xcb_connection_error_code > 0) DIE(connection, xcb_connect_error_to_string(xcb_connection_error_code));
 
+    // Handle events
+    xcb_generic_event_t *event = NULL;
+    while ((event = xcb_poll_for_event(connection))) {
+      if (event->response_type == 0) {
+        xcb_generic_error_t *error = (xcb_generic_error_t *)event;
+        xcb_print_error(error);
+        DIE(connection, "xcb_print_error");
+      } else {
+        xcb_print_event(event);
+        switch (event->response_type & 0x7F) {
+          case XCB_CLIENT_MESSAGE: {
+            const xcb_client_message_event_t *e = (const xcb_client_message_event_t *)event;
+            if (e->type == wm_protocols && e->data.data32[0] == wm_delete_window) {
+              fprintf(stderr, "Received WM_DELETE_WINDOW, quitting...\n");
+              quit = true;
+            }
+          } break;
+        }
+      }
+      free(event);
+    }
+
+    // Render
     render(&app, buffers[current_buffer], frame_count);
+
+    // TODO: set valid region depending on window size?
+    uint32_t serial = current_buffer;
+    xcb_xfixes_region_t valid = 0;
+    xcb_xfixes_region_t update = 0;
+    int16_t x_off = 0;
+    int16_t y_off = 0;
+    xcb_randr_crtc_t target_crtc = 0;
+    xcb_sync_fence_t wait_fence = 0;
+    xcb_sync_fence_t idle_fence = 0;
+    uint32_t options = XCB_PRESENT_OPTION_NONE;
+    uint64_t target_msc = 0;
+    uint64_t divisor = 0;
+    uint64_t remainder = 0;
+    uint32_t notifies_len = 0;
+    const xcb_present_notify_t *notifies = NULL;
+    xcb_present_pixmap(connection, window, pixmaps[current_buffer], serial,
+                      valid, update, x_off, y_off, target_crtc, wait_fence, idle_fence, options,
+                      target_msc, divisor, remainder, notifies_len, notifies);
 
     if (cursor != app.cursor) {
       xcb_change_window_attributes_value_list_t attributes = {.cursor = cursors[app.cursor]};
       xcb_change_window_attributes_aux(connection, window, XCB_CW_CURSOR, &attributes);
       cursor = app.cursor;
-      printf("changing cursor\n");
+      printf("Changed cursor.\n");
     }
 
-    xcb_present_pixmap(connection, window, pixmaps[current_buffer], frame_count,
-                      0, 0, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE, XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
     xcb_flush(connection);
 
-    {
-      xcb_generic_event_t *ev;
-      while ((ev = xcb_poll_for_event(connection))) {
-        if (ev->response_type == 0) {
-          xcb_generic_error_t *error = (xcb_generic_error_t *)ev;
-          xcb_print_error(error);
-        } else {
-          xcb_print_event(ev);
-          switch (ev->response_type & 0x7F) {
-            case XCB_CLIENT_MESSAGE: {
-              const xcb_client_message_event_t *e = (const xcb_client_message_event_t *)ev;
-              if (e->type == wm_protocols && e->data.data32[0] == wm_delete_window) {
-                  fprintf(stderr, "Received WM_DELETE_WINDOW, quitting...\n");
-                  quit = true;
-              }
-            } break;
-          }
+    // Sync
+    xcb_generic_event_t *extension_event = NULL;
+    while ((extension_event = xcb_wait_for_special_event(connection, special_event))) {
+      if ((extension_event->response_type & ~0x80) == XCB_GE_GENERIC) {
+        // xcb_print_event(extension_event);
+        xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)extension_event;
+        if (ge->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
+          free(ge);
+          break;
         }
-        free(ev);
+      } else if (extension_event->response_type == 0) {
+        xcb_generic_error_t *error = (xcb_generic_error_t *)extension_event;
+        xcb_print_error(error);
+        DIE(connection, "xcb_print_error");
       }
+      free(extension_event);
     }
-
-    {
-      #if 0
-      xcb_generic_event_t *ev;
-      while ((ev = xcb_wait_for_special_event(connection, special_event)) != NULL) {
-          if ((ev->response_type & ~0x80) == XCB_GE_GENERIC) {
-              xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)ev;
-              if (ge->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
-                  free(ev);
-                  break;
-              }
-          } else if (ev->response_type == 0) {
-            xcb_generic_error_t *error = (xcb_generic_error_t *)ev;
-            xcb_print_error(error);
-          }
-          free(ev);
-      }
-      #endif
-    }
-    usleep(1000);
 
     ++frame_count;
     current_buffer = (current_buffer + 1) % BUFFER_COUNT;
   }
-#else
-  xcb_flush(connection);
-  pause();
-#endif
   
   // TODO: create context and pass it to `DIE` to free everything
   for (int i = 0; i < BUFFER_COUNT; ++i) {
