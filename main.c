@@ -8,8 +8,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <linux/udmabuf.h>
 
@@ -19,6 +20,8 @@
 #include <xcb/xcb_cursor.h>
 
 #define BUFFER_COUNT 2
+#define PRESENT_COMPLETE_NOTIFY_TIMEOUT 50
+
 #define RED 0xFFFF0000
 #define WHITE 0xFFFFFFFF
 #define BLACK 0xFF000000
@@ -63,6 +66,7 @@ typedef struct App {
   Cursor cursor;
 } App;
 
+// TODO: make render do stuff on click
 void render(App *app, uint32_t *buf, int frame) {
   if (frame == 300) app->cursor = Cursor_Text;
 
@@ -570,6 +574,17 @@ int main() {
   xcb_special_event_t *special_event = xcb_register_for_special_xge(connection, &xcb_present_id, present_event, NULL);
   if (!special_event) DIE(connection, "xcb_register_for_special_xge");
 
+  int epollfd = epoll_create1(EPOLL_CLOEXEC);
+  if (epollfd == -1) DIE(connection, strerror(errno));
+
+  struct epoll_event epoll_event = {0};
+  struct epoll_event epoll_event_out = {0};
+  epoll_event.events = EPOLLIN;
+  epoll_event.data.fd = xcb_get_file_descriptor(connection);
+
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, epoll_event.data.fd, &epoll_event) == -1)
+    DIE(connection, strerror(errno));
+
   // Show window
   xcb_map_window(connection, window);
 
@@ -641,23 +656,35 @@ int main() {
 
     xcb_flush(connection);
 
-    // Sync
-    xcb_generic_event_t *extension_event = NULL;
-    while ((extension_event = xcb_wait_for_special_event(connection, special_event))) {
-      if ((extension_event->response_type & ~0x80) == XCB_GE_GENERIC) {
-        // xcb_print_event(extension_event);
-        xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)extension_event;
-        if (ge->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
-          free(ge);
-          break;
+    // V-Sync
+    for (;;) {
+      int ready_fds_count = epoll_wait(epollfd, &epoll_event_out, 1, PRESENT_COMPLETE_NOTIFY_TIMEOUT);
+      if (ready_fds_count > 0) {
+        xcb_generic_event_t *extension_event = NULL;
+        while ((extension_event = xcb_poll_for_special_event(connection, special_event))) {
+          if ((extension_event->response_type & ~0x80) == XCB_GE_GENERIC) {
+            // xcb_print_event(extension_event);
+            xcb_ge_generic_event_t *ge = (xcb_ge_generic_event_t *)extension_event;
+            if (ge->event_type == XCB_PRESENT_COMPLETE_NOTIFY) {
+              free(ge);
+              goto sync_end;
+            }
+          } else if (extension_event->response_type == 0) {
+            xcb_generic_error_t *error = (xcb_generic_error_t *)extension_event;
+            xcb_print_error(error);
+            DIE(connection, "xcb_print_error");
+          }
+          free(extension_event);
         }
-      } else if (extension_event->response_type == 0) {
-        xcb_generic_error_t *error = (xcb_generic_error_t *)extension_event;
-        xcb_print_error(error);
-        DIE(connection, "xcb_print_error");
+      } else if (ready_fds_count == 0) {
+        // Reached timeout. Errors are handled
+        // at the beginning of the next event loop.
+        break;
+      } else {
+        DIE(connection, strerror(errno));
       }
-      free(extension_event);
     }
+  sync_end:
 
     ++frame_count;
     current_buffer = (current_buffer + 1) % BUFFER_COUNT;
