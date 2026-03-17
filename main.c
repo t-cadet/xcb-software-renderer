@@ -1,4 +1,4 @@
-// gcc -std=c23 -O0 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -o main
+// gcc -std=c23 -O0 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -lxcb-sync -o main
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -17,6 +17,7 @@
 #include <xcb/xcb.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
+#include <xcb/sync.h>
 #include <xcb/xcb_cursor.h>
 
 #define BUFFER_COUNT 2
@@ -29,10 +30,17 @@
 const char* DRI3_EXTENSION_NAME = "DRI3";
 const char* PRESENT_EXTENSION_NAME = "Present";
 const char* RENDER_EXTENSION_NAME = "RENDER";
+const char* SYNC_EXTENSION_NAME = "SYNC";
 
 uint8_t DRI3_MAJOR_OPCODE = 0;
 uint8_t PRESENT_MAJOR_OPCODE = 0;
 uint8_t RENDER_MAJOR_OPCODE = 0;
+uint8_t SYNC_MAJOR_OPCODE = 0;
+
+#define SYNC_DESIRED_MAJOR_VERSION 3
+#define SYNC_DESIRED_MINOR_VERSION 1
+
+#define ARRAY_SIZE(xs) (sizeof(xs)/sizeof((xs)[0]))
 
 #define DIE(connection, message) die(connection, message, __FILE__, __LINE__)
 void die(xcb_connection_t *connection, const char *message, const char* file, int line) {
@@ -62,7 +70,7 @@ const char* get_cursor_name(Cursor cursor) {
 }
 
 typedef struct App {
-  int width, height;
+  int width, height, stride;
   Cursor cursor;
 } App;
 
@@ -72,10 +80,13 @@ void render(App *app, uint32_t *buf, int frame) {
 
   for (int y = 0; y < app->height; y++) {
     for (int x = 0; x < app->width; x++) {
-      int idx = y * app->width + x;
       int stripe_pos = (x + frame * 5) % 100;
       uint32_t color = (stripe_pos < 50) ? WHITE : BLACK;
-      if (y == (frame * 10) % app->height) {
+      if (y == (frame % 101)*app->height/100) {
+        color = RED;
+      }
+      int idx = y * app->stride + x;
+      if (x < 50 && y < 50) {
         color = RED;
       }
       buf[idx] = color;
@@ -131,6 +142,7 @@ const char* xcb_major_code_to_string(uint8_t major_code) {
       if (major_code == DRI3_MAJOR_OPCODE) return DRI3_EXTENSION_NAME;
       else if (major_code == PRESENT_MAJOR_OPCODE) return PRESENT_EXTENSION_NAME;
       else if (major_code == RENDER_MAJOR_OPCODE) return RENDER_EXTENSION_NAME;
+      else if (major_code == SYNC_MAJOR_OPCODE) return SYNC_EXTENSION_NAME;
       return "Unknown";
     }
   }
@@ -169,10 +181,22 @@ const char* xcb_render_minor_code_to_string(uint8_t minor_code) {
   }
 }
 
+const char* xcb_sync_minor_code_to_string(uint8_t minor_code) {
+  // sync.h
+  switch (minor_code) {
+    case XCB_SYNC_INITIALIZE:      return "Initialize";
+    case XCB_SYNC_CREATE_COUNTER:  return "CreateCounter";
+    case XCB_SYNC_SET_COUNTER:     return "SetCounter";
+    case XCB_SYNC_DESTROY_COUNTER: return "DestroyCounter";
+    default: return "Unknown";
+  }
+}
+
 const char* xcb_minor_code_to_string(uint8_t major_code, uint8_t minor_code) {
   if (major_code == DRI3_MAJOR_OPCODE) return xcb_dri3_minor_code_to_string(minor_code);
   if (major_code == PRESENT_MAJOR_OPCODE) return xcb_present_minor_code_to_string(minor_code);
   if (major_code == RENDER_MAJOR_OPCODE) return xcb_render_minor_code_to_string(minor_code);
+  if (major_code == SYNC_MAJOR_OPCODE) return xcb_sync_minor_code_to_string(minor_code);
   return "";
 }
 
@@ -425,14 +449,18 @@ int main() {
   int xcb_connect_error_code = xcb_connection_has_error(connection);
   if (xcb_connect_error_code > 0) DIE(connection, xcb_connect_error_to_string(xcb_connect_error_code));
 
-  // Prefetch extension data (no need to check extension versions as we only use v1.0 requests)
+  // Prefetch extension data
   xcb_query_extension_cookie_t query_extension_dri3_cookie = xcb_query_extension(connection, strlen(DRI3_EXTENSION_NAME), DRI3_EXTENSION_NAME);
   xcb_query_extension_cookie_t query_extension_present_cookie = xcb_query_extension(connection, strlen(PRESENT_EXTENSION_NAME), PRESENT_EXTENSION_NAME);
+  xcb_query_extension_cookie_t query_extension_sync_cookie = xcb_query_extension(connection, strlen(SYNC_EXTENSION_NAME), SYNC_EXTENSION_NAME);
+  xcb_sync_initialize_cookie_t xcb_sync_initialize_cookie = xcb_sync_initialize(connection, SYNC_DESIRED_MAJOR_VERSION, SYNC_DESIRED_MINOR_VERSION);
 
   // Prefetch atoms
   bool only_if_exists = false;
   xcb_intern_atom_cookie_t wm_protocols_cookie = xcb_intern_atom(connection, only_if_exists, strlen("WM_PROTOCOLS"), "WM_PROTOCOLS");
   xcb_intern_atom_cookie_t wm_delete_window_cookie = xcb_intern_atom(connection, only_if_exists, strlen("WM_DELETE_WINDOW"), "WM_DELETE_WINDOW");
+  xcb_intern_atom_cookie_t wm_sync_request_cookie = xcb_intern_atom(connection, only_if_exists, strlen("_NET_WM_SYNC_REQUEST"), "_NET_WM_SYNC_REQUEST");
+  xcb_intern_atom_cookie_t wm_sync_request_counter_cookie = xcb_intern_atom(connection, only_if_exists, strlen("_NET_WM_SYNC_REQUEST_COUNTER"), "_NET_WM_SYNC_REQUEST_COUNTER");
 
   xcb_flush(connection);
 
@@ -486,9 +514,10 @@ int main() {
   app.height = screen->height_in_pixels/2;
   int border_width = 0;
   int class = XCB_WINDOW_CLASS_INPUT_OUTPUT;
-  uint32_t value_mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_CURSOR;
+  uint32_t value_mask = XCB_CW_BACK_PIXMAP | XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK | XCB_CW_CURSOR;
   xcb_create_window_value_list_t value_list = {0};
-  value_list.background_pixel = screen->black_pixel;
+  value_list.background_pixmap = XCB_BACK_PIXMAP_NONE;
+  value_list.bit_gravity = XCB_GRAVITY_STATIC;
   value_list.event_mask = XCB_EVENT_MASK_KEY_PRESS
                         | XCB_EVENT_MASK_KEY_RELEASE
                         | XCB_EVENT_MASK_BUTTON_PRESS
@@ -499,7 +528,6 @@ int main() {
                         // | XCB_EVENT_MASK_KEYMAP_STATE
                         | XCB_EVENT_MASK_VISIBILITY_CHANGE
                         | XCB_EVENT_MASK_STRUCTURE_NOTIFY
-                        // | XCB_EVENT_MASK_RESIZE_REDIRECT
                         // | XCB_EVENT_MASK_FOCUS_CHANGE
                         ;
   value_list.cursor = cursors[app.cursor];
@@ -518,17 +546,23 @@ int main() {
   xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, format, strlen(title), title);
   xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_ICON_NAME, XCB_ATOM_STRING, format, strlen(title), title);
 
-  // Retrieve atoms & handle window closing
+  // Retrieve atoms & register for window manager protocols
   xcb_atom_t wm_protocols = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_protocols_cookie);
   xcb_atom_t wm_delete_window = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_delete_window_cookie);
-  xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, wm_protocols, XCB_ATOM_ATOM, sizeof(wm_delete_window)*8, 1, &wm_delete_window);
+  xcb_atom_t wm_sync_request = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_sync_request_cookie);
+  xcb_atom_t wm_sync_request_counter = XCB_INTERN_ATOM_REPLY_OR_DIE(connection, wm_sync_request_counter_cookie);
+
+  xcb_atom_t wm_protocol_atoms[] = { wm_delete_window, wm_sync_request };
+  xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, wm_protocols, XCB_ATOM_ATOM, sizeof(xcb_atom_t)*8, ARRAY_SIZE(wm_protocol_atoms), wm_protocol_atoms);
 
   // Retrieve extension major opcode
   DRI3_MAJOR_OPCODE = XCB_QUERY_EXTENSION_MAJOR_OPCODE_OR_DIE(connection, query_extension_dri3_cookie);
   PRESENT_MAJOR_OPCODE = XCB_QUERY_EXTENSION_MAJOR_OPCODE_OR_DIE(connection, query_extension_present_cookie);
+  SYNC_MAJOR_OPCODE = XCB_QUERY_EXTENSION_MAJOR_OPCODE_OR_DIE(connection, query_extension_sync_cookie);
 
   // Create buffers
   int stride = (screen->width_in_pixels * 4 + 63) & ~63;
+  app.stride = stride / 4;
   int size = stride * screen->height_in_pixels;
 
   int udmabuf_device = open("/dev/udmabuf", O_RDWR);
@@ -585,6 +619,27 @@ int main() {
   if (epoll_ctl(epollfd, EPOLL_CTL_ADD, epoll_event.data.fd, &epoll_event) == -1)
     DIE(connection, strerror(errno));
 
+  // Setup Sync extension
+  xcb_generic_error_t *xcb_sync_initialize_reply_error = NULL;
+  xcb_sync_initialize_reply_t *sync_initialize_reply = xcb_sync_initialize_reply(connection, xcb_sync_initialize_cookie, &xcb_sync_initialize_reply_error);
+  if (xcb_sync_initialize_reply_error) {
+    xcb_print_error(xcb_sync_initialize_reply_error);
+    free(xcb_sync_initialize_reply_error);
+    DIE(connection, "xcb_sync_initialize_reply_error");
+  }
+  if (!sync_initialize_reply) DIE(connection, "sync_initialize_reply");
+  if (sync_initialize_reply->major_version  < SYNC_DESIRED_MAJOR_VERSION ||
+     (sync_initialize_reply->major_version == SYNC_DESIRED_MAJOR_VERSION && 
+      sync_initialize_reply->minor_version  < SYNC_DESIRED_MINOR_VERSION)) {
+    DIE(connection, "sync_initialize_reply: version mismatch");
+  }
+  free(sync_initialize_reply);
+
+  xcb_sync_counter_t sync_counter = xcb_generate_id(connection);
+  xcb_sync_int64_t zero_sync_value = {0, 0};
+  xcb_sync_create_counter(connection, sync_counter, zero_sync_value);
+  xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, wm_sync_request_counter, XCB_ATOM_CARDINAL, sizeof(sync_counter)*8, 1, &sync_counter);
+
   // Show window
   xcb_map_window(connection, window);
 
@@ -596,8 +651,8 @@ int main() {
   int current_buffer = 0;
   uint32_t frame_count = 0;
 
-  // TODO: correctly position image based on x, y, w, h
-  // TODO: handle resize
+  xcb_sync_int64_t pending_sync_value = zero_sync_value;
+  xcb_sync_int64_t acknowledged_sync_value = zero_sync_value;
 
   while (!quit) {
     int xcb_connection_error_code = xcb_connection_has_error(connection);
@@ -613,11 +668,23 @@ int main() {
       } else {
         xcb_print_event(event);
         switch (event->response_type & 0x7F) {
+          case XCB_CONFIGURE_NOTIFY: {
+            const xcb_configure_notify_event_t *e = (const xcb_configure_notify_event_t *)event;
+            app.width = e->width;
+            app.height = e->height;
+            acknowledged_sync_value = pending_sync_value;
+            pending_sync_value = zero_sync_value;
+          } break;
           case XCB_CLIENT_MESSAGE: {
             const xcb_client_message_event_t *e = (const xcb_client_message_event_t *)event;
-            if (e->type == wm_protocols && e->data.data32[0] == wm_delete_window) {
-              fprintf(stderr, "Received WM_DELETE_WINDOW, quitting...\n");
-              quit = true;
+            if (e->type == wm_protocols) {
+              if(e->data.data32[0] == wm_delete_window) {
+                fprintf(stderr, "Received WM_DELETE_WINDOW, quitting...\n");
+                quit = true;
+              } else if (e->data.data32[0] == wm_sync_request) {
+                pending_sync_value.lo = e->data.data32[2];
+                pending_sync_value.hi = e->data.data32[3];
+              }
             }
           } break;
         }
@@ -628,7 +695,6 @@ int main() {
     // Render
     render(&app, buffers[current_buffer], frame_count);
 
-    // TODO: set valid region depending on window size?
     uint32_t serial = current_buffer;
     xcb_xfixes_region_t valid = 0;
     xcb_xfixes_region_t update = 0;
@@ -651,7 +717,7 @@ int main() {
       xcb_change_window_attributes_value_list_t attributes = {.cursor = cursors[app.cursor]};
       xcb_change_window_attributes_aux(connection, window, XCB_CW_CURSOR, &attributes);
       cursor = app.cursor;
-      printf("Changed cursor.\n");
+      fprintf(stderr, "Changed cursor.\n");
     }
 
     xcb_flush(connection);
@@ -686,6 +752,12 @@ int main() {
     }
   sync_end:
 
+    if (acknowledged_sync_value.lo != 0 || acknowledged_sync_value.hi != 0) {
+      xcb_sync_set_counter(connection, sync_counter, acknowledged_sync_value);
+      acknowledged_sync_value = zero_sync_value;
+    }
+
+    fprintf(stderr, "--- FRAME %d DONE ---\n", frame_count);
     ++frame_count;
     current_buffer = (current_buffer + 1) % BUFFER_COUNT;
   }
@@ -694,6 +766,7 @@ int main() {
   for (int i = 0; i < BUFFER_COUNT; ++i) {
     if (buffers[i]) munmap(buffers[i], size);
   }
+  xcb_sync_destroy_counter(connection, sync_counter);
   xcb_disconnect(connection);
   return 0;
 }
