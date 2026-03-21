@@ -780,8 +780,13 @@ int main() {
               }
             }
           } break;
+          case XCB_MAPPING_NOTIFY: {
+            xcb_mapping_notify_event_t *e = (xcb_mapping_notify_event_t *)event;
+            xcb_refresh_keyboard_mapping(key_symbols, e);
+          } break;
           case XCB_KEY_PRESS: {
             xcb_key_press_event_t *e = (xcb_key_press_event_t *)event;
+            // Note: blocks if the reply from a mapping refresh has yet to arrive
             xcb_keysym_t keysym = xcb_key_press_lookup_keysym(key_symbols, e, 0);
             if (keysym >= ' ' && keysym <= 255) {
               app_events.key = keysym;
