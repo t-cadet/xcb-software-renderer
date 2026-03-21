@@ -23,9 +23,15 @@
 #define BUFFER_COUNT 2
 #define PRESENT_COMPLETE_NOTIFY_TIMEOUT 50
 
-#define RED 0xFFFF0000
-#define WHITE 0xFFFFFFFF
-#define BLACK 0xFF000000
+#define COLOR_WHITE 0xFFFFFFFF
+#define COLOR_BLACK 0xFF000000
+
+#define COLOR_SCAN_LINE    0xFFFF3A5C
+#define COLOR_STRIPE_A     0xFF071C2C
+#define COLOR_STRIPE_B     0xFFFF6B35
+#define COLOR_DT_GRAPH     0xFF00E5CC
+#define COLOR_BUTTON       0xFF7B2FBE
+#define COLOR_BUTTON_HOVER 0xFFA855F7
 
 const char* DRI3_EXTENSION_NAME = "DRI3";
 const char* PRESENT_EXTENSION_NAME = "Present";
@@ -49,6 +55,9 @@ void die(xcb_connection_t *connection, const char *message, const char* file, in
   exit(1);
 }
 
+#define FRAME_DT_GRAPH_SIZE 120
+float FRAME_DT_GRAPH[FRAME_DT_GRAPH_SIZE] = {0};
+
 typedef enum Cursor {
   Cursor_Default = 0,
   Cursor_Pointer,
@@ -71,26 +80,95 @@ const char* get_cursor_name(Cursor cursor) {
 
 typedef struct App {
   int width, height, stride;
+
+  bool paused;
+  int stripes_frame;
+
+  int mouse_x, mouse_y;
   Cursor cursor;
 } App;
 
-// TODO: make render do stuff on click
-void render(App *app, uint32_t *buf, int frame) {
-  if (frame == 300) app->cursor = Cursor_Text;
+typedef struct Events {
+  bool clicked;
+  char key;
+} Events;
 
+void draw_rectangle(uint32_t *buf, int start_x, int start_y, int width, int height, int stride, int color) {
+  for (int y = start_y; y < start_y + height; ++y) {
+    for (int x = start_x; x < start_x + width; ++x) {
+      buf[y*stride + x] = color;
+    }
+  }
+}
+
+void render(App *app, uint32_t *buf, Events* events, int frame, float dt) {
+  // Clear
+  // draw_rectangle(buf, 0, 0, app->width, app->height, app->stride, BLACK);
+  app->cursor = Cursor_Default;
+
+  // Tear test
+  int stripes_speed = 3;
+  int stripes_width = 64;
   for (int y = 0; y < app->height; y++) {
     for (int x = 0; x < app->width; x++) {
-      int stripe_pos = (x + frame * 5) % 100;
-      uint32_t color = (stripe_pos < 50) ? WHITE : BLACK;
-      if (y == (frame % 101)*app->height/100) {
-        color = RED;
-      }
-      int idx = y * app->stride + x;
-      if (x < 50 && y < 50) {
-        color = RED;
-      }
-      buf[idx] = color;
+      int stripe_pos = (x + app->stripes_frame*stripes_speed) % (stripes_width*2);
+      uint32_t color = (stripe_pos < stripes_width) ? COLOR_STRIPE_A : COLOR_STRIPE_B;
+      buf[y*app->stride + x] = color;
     }
+  }
+  int scan_line_y = (app->stripes_frame % 120)*app->height/120;
+  draw_rectangle(buf, 0, scan_line_y, app->width, 1, app->stride, COLOR_SCAN_LINE);
+  if (!app->paused) app->stripes_frame += 1;
+
+  // Frame dt graph
+  FRAME_DT_GRAPH[frame % FRAME_DT_GRAPH_SIZE] = dt;
+
+  int frame_base_width = app->width / FRAME_DT_GRAPH_SIZE;
+  int rem_width = app->width % FRAME_DT_GRAPH_SIZE;
+
+  int FPS_AT_MAX_HEIGHT = 60;
+  int half_height = app->height / 2;
+
+  for (int y = 0; y < half_height; ++y) {
+    for (int frame_index=0, frame_start_x=0; frame_index < FRAME_DT_GRAPH_SIZE; ++frame_index) {
+
+      int frame_dt_index = (frame + 1 + frame_index) % FRAME_DT_GRAPH_SIZE;
+      int frame_height = FRAME_DT_GRAPH[frame_dt_index]*half_height*FPS_AT_MAX_HEIGHT;
+      if (frame_height > half_height) frame_height = half_height;
+
+      int frame_width_with_rem = frame_base_width + ((frame_index < rem_width) ? 1 : 0);
+
+      if (y >= (half_height - frame_height)) {
+        for (int x = frame_start_x; x < frame_start_x + frame_width_with_rem - 1; ++x) {
+          buf[y*app->stride + x] = COLOR_DT_GRAPH;
+        }
+      }
+
+      frame_start_x += frame_width_with_rem;
+    }
+  }
+
+  // Pause Button
+  int button_w = 80;
+  int button_h = 50;
+  int button_x = (app->width - button_w)/2;
+  int button_y = (app->height*3 - button_h*2)/4;
+  int button_color = COLOR_BUTTON;
+
+  if ((app->mouse_x >= button_x && app->mouse_x < (button_x + button_w)) &&
+      (app->mouse_y >= button_y && app->mouse_y < (button_y + button_h))) {
+    button_color = COLOR_BUTTON_HOVER;
+    app->cursor = Cursor_Pointer;
+    if (events->clicked) {
+      app->paused = !app->paused;
+    }
+  }
+
+  draw_rectangle(buf, button_x, button_y, button_w, button_h, app->stride, button_color);
+
+  // Pause Key
+  if (events->key == ' ') {
+    app->paused = !app->paused;
   }
 }
 
@@ -650,15 +728,23 @@ int main() {
   bool quit = false;
   int current_buffer = 0;
   uint32_t frame_count = 0;
+  float dt = 0.0;
 
   xcb_sync_int64_t pending_sync_value = zero_sync_value;
   xcb_sync_int64_t acknowledged_sync_value = zero_sync_value;
 
   while (!quit) {
+    struct timespec start_time = {0};
+    struct timespec end_time = {0};
+
+    if (clock_gettime(CLOCK_REALTIME, &start_time) == -1)
+      DIE(connection, strerror(errno));
+
     int xcb_connection_error_code = xcb_connection_has_error(connection);
     if (xcb_connection_error_code > 0) DIE(connection, xcb_connect_error_to_string(xcb_connection_error_code));
 
     // Handle events
+    Events app_events = {0};
     xcb_generic_event_t *event = NULL;
     while ((event = xcb_poll_for_event(connection))) {
       if (event->response_type == 0) {
@@ -687,13 +773,28 @@ int main() {
               }
             }
           } break;
+          case XCB_KEY_PRESS: {
+            const xcb_key_press_event_t *e = (const xcb_key_press_event_t *)event;
+            if (e->detail == 65) {
+              app_events.key = ' ';
+            }
+          } break;
+          case XCB_BUTTON_PRESS: {
+            const xcb_button_press_event_t *e = (const xcb_button_press_event_t *)event;
+            app_events.clicked = (e->detail == 1);
+          } break;
+          case XCB_MOTION_NOTIFY: {
+            const xcb_motion_notify_event_t *e = (const xcb_motion_notify_event_t *)event;
+            app.mouse_x = e->event_x;
+            app.mouse_y = e->event_y;
+          } break;
         }
       }
       free(event);
     }
 
     // Render
-    render(&app, buffers[current_buffer], frame_count);
+    render(&app, buffers[current_buffer], &app_events, frame_count, dt);
 
     uint32_t serial = current_buffer;
     xcb_xfixes_region_t valid = 0;
@@ -721,6 +822,10 @@ int main() {
     }
 
     xcb_flush(connection);
+
+    if (clock_gettime(CLOCK_REALTIME, &end_time) == -1)
+      DIE(connection, strerror(errno));
+    dt = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec)*1e-9;
 
     // V-Sync
     for (;;) {
@@ -757,7 +862,14 @@ int main() {
       acknowledged_sync_value = zero_sync_value;
     }
 
-    fprintf(stderr, "--- FRAME %d DONE ---\n", frame_count);
+  #if 0
+    struct timespec sync_end_time = {0};
+    if (clock_gettime(CLOCK_REALTIME, &sync_end_time) == -1)
+      DIE(connection, strerror(errno));
+    float sync_dt = (sync_end_time.tv_sec - start_time.tv_sec) + (sync_end_time.tv_nsec - start_time.tv_nsec)*1e-9;
+    fprintf(stderr, "--- FRAME %d DONE: %0.2f ms, sync: %0.2f ms ---\n", frame_count, dt*1e3, sync_dt*1e3);
+  #endif
+
     ++frame_count;
     current_buffer = (current_buffer + 1) % BUFFER_COUNT;
   }
