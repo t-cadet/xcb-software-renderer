@@ -1,4 +1,4 @@
-// gcc -std=c23 -O0 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -lxcb-sync -o main
+// gcc -std=c23 -O2 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -lxcb-sync -lxcb-keysyms -o main
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -19,6 +19,9 @@
 #include <xcb/present.h>
 #include <xcb/sync.h>
 #include <xcb/xcb_cursor.h>
+#include <xcb/xcb_keysyms.h>
+
+// #include <X11/keysymdef.h>
 
 #define BUFFER_COUNT 2
 #define PRESENT_COMPLETE_NOTIFY_TIMEOUT 50
@@ -540,6 +543,10 @@ int main() {
   xcb_intern_atom_cookie_t wm_sync_request_cookie = xcb_intern_atom(connection, only_if_exists, strlen("_NET_WM_SYNC_REQUEST"), "_NET_WM_SYNC_REQUEST");
   xcb_intern_atom_cookie_t wm_sync_request_counter_cookie = xcb_intern_atom(connection, only_if_exists, strlen("_NET_WM_SYNC_REQUEST_COUNTER"), "_NET_WM_SYNC_REQUEST_COUNTER");
 
+  // Prefetch keyboard mapping
+  xcb_key_symbols_t *key_symbols = xcb_key_symbols_alloc(connection);
+  if (!key_symbols) DIE(connection, "xcb_key_symbols_alloc");
+
   xcb_flush(connection);
 
   // Find preferred screen
@@ -774,9 +781,10 @@ int main() {
             }
           } break;
           case XCB_KEY_PRESS: {
-            const xcb_key_press_event_t *e = (const xcb_key_press_event_t *)event;
-            if (e->detail == 65) {
-              app_events.key = ' ';
+            xcb_key_press_event_t *e = (xcb_key_press_event_t *)event;
+            xcb_keysym_t keysym = xcb_key_press_lookup_keysym(key_symbols, e, 0);
+            if (keysym >= ' ' && keysym <= 255) {
+              app_events.key = keysym;
             }
           } break;
           case XCB_BUTTON_PRESS: {
@@ -796,6 +804,7 @@ int main() {
     // Render
     render(&app, buffers[current_buffer], &app_events, frame_count, dt);
 
+    // TODO?: adaptive frame pacing
     uint32_t serial = current_buffer;
     xcb_xfixes_region_t valid = 0;
     xcb_xfixes_region_t update = 0;
@@ -879,6 +888,7 @@ int main() {
     if (buffers[i]) munmap(buffers[i], size);
   }
   xcb_sync_destroy_counter(connection, sync_counter);
+  xcb_key_symbols_free(key_symbols);
   xcb_disconnect(connection);
   return 0;
 }
