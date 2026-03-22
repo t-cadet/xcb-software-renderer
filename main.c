@@ -1,4 +1,11 @@
-// gcc -std=c23 -O2 -g -Wall main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -lxcb-sync -lxcb-keysyms -o main
+// gcc -std=c23 -O2 -g -Wall -Wextra main.c -lxcb -lxcb-dri3 -lxcb-present -lxcb-cursor -lxcb-render -lxcb-sync -lxcb-keysyms -o main
+
+// To improve:
+//  - Use XKB extension to handle keyboard events (better layout reload, dead keys & modes)
+//  - Optimize rendering when the window is hidden
+//  - Implement adaptive frame-pacing
+//  - Handle windows larger than screen, multiple monitors, monitor change etc
+//  - Close all resources in DIE?
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -96,17 +103,26 @@ typedef struct Events {
   char key;
 } Events;
 
-void draw_rectangle(uint32_t *buf, int start_x, int start_y, int width, int height, int stride, int color) {
-  for (int y = start_y; y < start_y + height; ++y) {
-    for (int x = start_x; x < start_x + width; ++x) {
+void draw_rectangle(App *app, uint32_t *buf, int start_x, int start_y, int width, int height, int stride, int color) {
+  int end_x = start_x + width;
+  int end_y = start_y + height;
+
+  if (end_x > app->width) end_x = app->width;
+  if (end_y > app->height) end_y = app->height;
+
+  if (start_x < 0) start_x = 0;
+  if (start_y < 0) start_y = 0;
+
+  for (int y = start_y; y < end_y; ++y) {
+    for (int x = start_x; x < end_x; ++x) {
       buf[y*stride + x] = color;
     }
   }
 }
 
-void render(App *app, uint32_t *buf, Events* events, int frame, float dt) {
+void render(App *app, uint32_t *buf, Events* events, int frame, float processing_dt) {
   // Clear
-  // draw_rectangle(buf, 0, 0, app->width, app->height, app->stride, BLACK);
+  // draw_rectangle(app, buf, 0, 0, app->width, app->height, app->stride, BLACK);
   app->cursor = Cursor_Default;
 
   // Tear test
@@ -120,11 +136,11 @@ void render(App *app, uint32_t *buf, Events* events, int frame, float dt) {
     }
   }
   int scan_line_y = (app->stripes_frame % 120)*app->height/120;
-  draw_rectangle(buf, 0, scan_line_y, app->width, 1, app->stride, COLOR_SCAN_LINE);
+  draw_rectangle(app, buf, 0, scan_line_y, app->width, 1, app->stride, COLOR_SCAN_LINE);
   if (!app->paused) app->stripes_frame += 1;
 
   // Frame dt graph
-  FRAME_DT_GRAPH[frame % FRAME_DT_GRAPH_SIZE] = dt;
+  FRAME_DT_GRAPH[frame % FRAME_DT_GRAPH_SIZE] = processing_dt;
 
   int frame_base_width = app->width / FRAME_DT_GRAPH_SIZE;
   int rem_width = app->width % FRAME_DT_GRAPH_SIZE;
@@ -167,7 +183,7 @@ void render(App *app, uint32_t *buf, Events* events, int frame, float dt) {
     }
   }
 
-  draw_rectangle(buf, button_x, button_y, button_w, button_h, app->stride, button_color);
+  draw_rectangle(app, buf, button_x, button_y, button_w, button_h, app->stride, button_color);
 
   // Pause Key
   if (events->key == ' ') {
@@ -593,10 +609,10 @@ int main() {
   xcb_cursor_context_free(cursor_context);
 
   // Create window
-  int x = (screen->width_in_pixels - app.width)/2;
-  int y = (screen->height_in_pixels - app.height)/2;
   app.width = screen->width_in_pixels/2;
   app.height = screen->height_in_pixels/2;
+  int x = (screen->width_in_pixels - app.width)/2;
+  int y = (screen->height_in_pixels - app.height)/2;
   int border_width = 0;
   int class = XCB_WINDOW_CLASS_INPUT_OUTPUT;
   uint32_t value_mask = XCB_CW_BACK_PIXMAP | XCB_CW_BIT_GRAVITY | XCB_CW_EVENT_MASK | XCB_CW_CURSOR;
@@ -648,7 +664,9 @@ int main() {
   // Create buffers
   int stride = (screen->width_in_pixels * 4 + 63) & ~63;
   app.stride = stride / 4;
-  int size = stride * screen->height_in_pixels;
+
+  int page_size = getpagesize();
+  int size = (stride * screen->height_in_pixels + (page_size - 1)) & ~(page_size - 1);
 
   int udmabuf_device = open("/dev/udmabuf", O_RDWR);
   if (udmabuf_device < 0) DIE(connection, strerror(errno));
@@ -668,7 +686,7 @@ int main() {
       DIE(connection, strerror(errno));
 
     buffers[i] = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-    if (buffers[i] < 0) DIE(connection, strerror(errno));
+    if (buffers[i] == MAP_FAILED) DIE(connection, strerror(errno));
     memset(buffers[i], 0, size);
 
     struct udmabuf_create create = {0};
@@ -734,8 +752,8 @@ int main() {
   // Event loop state
   bool quit = false;
   int current_buffer = 0;
-  uint32_t frame_count = 0;
-  float dt = 0.0;
+  int frame_count = 0;
+  float processing_dt = 0.0;
 
   xcb_sync_int64_t pending_sync_value = zero_sync_value;
   xcb_sync_int64_t acknowledged_sync_value = zero_sync_value;
@@ -744,7 +762,7 @@ int main() {
     struct timespec start_time = {0};
     struct timespec end_time = {0};
 
-    if (clock_gettime(CLOCK_REALTIME, &start_time) == -1)
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time) == -1)
       DIE(connection, strerror(errno));
 
     int xcb_connection_error_code = xcb_connection_has_error(connection);
@@ -765,6 +783,14 @@ int main() {
             const xcb_configure_notify_event_t *e = (const xcb_configure_notify_event_t *)event;
             app.width = e->width;
             app.height = e->height;
+            if (app.width > screen->width_in_pixels) {
+              fprintf(stderr, "[WARNING] cannot resize window to be larger than screen, clamping to screen width\n");
+              app.width = screen->width_in_pixels;
+            }
+            if (app.height > screen->height_in_pixels) {
+              fprintf(stderr, "[WARNING] cannot resize window to be taller than screen, clamping to screen height\n");
+              app.height = screen->height_in_pixels;
+            }
             acknowledged_sync_value = pending_sync_value;
             pending_sync_value = zero_sync_value;
           } break;
@@ -807,9 +833,8 @@ int main() {
     }
 
     // Render
-    render(&app, buffers[current_buffer], &app_events, frame_count, dt);
+    render(&app, buffers[current_buffer], &app_events, frame_count, processing_dt);
 
-    // TODO?: adaptive frame pacing
     uint32_t serial = current_buffer;
     xcb_xfixes_region_t valid = 0;
     xcb_xfixes_region_t update = 0;
@@ -837,9 +862,9 @@ int main() {
 
     xcb_flush(connection);
 
-    if (clock_gettime(CLOCK_REALTIME, &end_time) == -1)
+    if (clock_gettime(CLOCK_MONOTONIC, &end_time) == -1)
       DIE(connection, strerror(errno));
-    dt = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec)*1e-9;
+    processing_dt = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec)*1e-9;
 
     // V-Sync
     for (;;) {
@@ -866,6 +891,7 @@ int main() {
         // at the beginning of the next event loop.
         break;
       } else {
+        if (errno == EINTR) continue;
         DIE(connection, strerror(errno));
       }
     }
@@ -878,21 +904,22 @@ int main() {
 
   #if 0
     struct timespec sync_end_time = {0};
-    if (clock_gettime(CLOCK_REALTIME, &sync_end_time) == -1)
+    if (clock_gettime(CLOCK_MONOTONIC, &sync_end_time) == -1)
       DIE(connection, strerror(errno));
     float sync_dt = (sync_end_time.tv_sec - start_time.tv_sec) + (sync_end_time.tv_nsec - start_time.tv_nsec)*1e-9;
-    fprintf(stderr, "--- FRAME %d DONE: %0.2f ms, sync: %0.2f ms ---\n", frame_count, dt*1e3, sync_dt*1e3);
+    fprintf(stderr, "--- FRAME %d DONE: %0.2f ms, sync: %0.2f ms ---\n", frame_count, processing_dt*1e3, sync_dt*1e3);
   #endif
 
     ++frame_count;
     current_buffer = (current_buffer + 1) % BUFFER_COUNT;
   }
   
-  // TODO: create context and pass it to `DIE` to free everything
   for (int i = 0; i < BUFFER_COUNT; ++i) {
     if (buffers[i]) munmap(buffers[i], size);
+    if (udmabufs[i] >= 0) close(udmabufs[i]);
   }
   xcb_sync_destroy_counter(connection, sync_counter);
+  xcb_unregister_for_special_event(connection, special_event);
   xcb_key_symbols_free(key_symbols);
   xcb_disconnect(connection);
   return 0;
