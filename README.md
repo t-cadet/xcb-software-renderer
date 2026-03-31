@@ -1,4 +1,4 @@
-## Overview
+# Overview
 
 A modern *Platform Layer* for XCB software rendering.
 
