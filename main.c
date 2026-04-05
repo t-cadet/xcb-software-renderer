@@ -100,12 +100,13 @@ typedef struct App {
   int trial_onset_delays[TRIAL_SIZE];
   int trial_reaction_frames[TRIAL_SIZE];
 
-  char *trial_tags;
+  int trial_tags_size;
+  const char **trial_tags;
   
   Cursor cursor;
 } App;
 
-void app_init(App *app) {
+void app_init(App *app, int argc, const char **argv) {
   srand(time(NULL));
 
   int min_offset = 1*60;
@@ -113,15 +114,26 @@ void app_init(App *app) {
     app->trial_onset_delays[i] = min_offset + rand() % 120;
   }
 
-  app->trial_tags = "";
+  if (argc > 1) {
+    app->trial_tags_size = argc - 1;
+    app->trial_tags = argv + 1;
+  }
 }
 
 void app_write_reaction_times(App *app, FILE *fd, const char *timestamp) {
   timestamp = timestamp ? timestamp : "(null)";
   fprintf(fd, "i,timestamp,onset_delay_in_frames,reaction_time_in_frames,reaction_time_in_seconds,tags\n");
   for (int i = 0; i < TRIAL_SIZE; ++i) {
-    fprintf(fd, "%02d,%s,%02d,%02d,%0.3f,%s\n", i, timestamp, app->trial_onset_delays[i],
-            app->trial_reaction_frames[i], app->trial_reaction_frames[i] * (1.0/60.0), app->trial_tags);
+    fprintf(fd, "%02d,%s,%02d,%02d,%0.3f", i, timestamp, app->trial_onset_delays[i],
+            app->trial_reaction_frames[i], app->trial_reaction_frames[i] * (1.0/60.0));
+    if (app->trial_tags_size) {
+      fprintf(fd, ",");
+      for (int tag_index = 0; tag_index < app->trial_tags_size - 1; ++tag_index) {
+        fprintf(fd, "%s|", app->trial_tags[tag_index]);
+      }
+      fprintf(fd, "%s", app->trial_tags[app->trial_tags_size - 1]);
+    }
+    fprintf(fd, "\n");
   }
 }
 
@@ -559,7 +571,7 @@ uint8_t xcb_query_extension_reply_or_die(xcb_connection_t *connection, xcb_query
   return major_opcode;
 }
 
-int main() {
+int main(int argc, const char **argv) {
   App app = {0};
   
   // Connect to X11 server
@@ -779,7 +791,7 @@ int main() {
   xcb_sync_int64_t pending_sync_value = zero_sync_value;
   xcb_sync_int64_t acknowledged_sync_value = zero_sync_value;
 
-  app_init(&app);
+  app_init(&app, argc, argv);
 
   while (!app.quit) {
     struct timespec start_time = {0};
