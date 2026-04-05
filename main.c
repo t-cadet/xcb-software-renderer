@@ -18,6 +18,7 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <linux/udmabuf.h>
 
@@ -65,8 +66,7 @@ void die(xcb_connection_t *connection, const char *message, const char* file, in
   exit(1);
 }
 
-#define FRAME_DT_GRAPH_SIZE 120
-float FRAME_DT_GRAPH[FRAME_DT_GRAPH_SIZE] = {0};
+#define TRIAL_SIZE 10
 
 typedef enum Cursor {
   Cursor_Default = 0,
@@ -90,13 +90,80 @@ const char* get_cursor_name(Cursor cursor) {
 
 typedef struct App {
   int width, height, stride;
-
-  bool paused;
-  int stripes_frame;
-
   int mouse_x, mouse_y;
+
+  bool quit;
+
+  bool in_trial;
+  int trial_index;
+  int trial_reference_frame;
+  int trial_onset_delays[TRIAL_SIZE];
+  int trial_reaction_frames[TRIAL_SIZE];
+
+  char *trial_tags;
+  
   Cursor cursor;
 } App;
+
+void app_init(App *app) {
+  srand(time(NULL));
+
+  int min_offset = 1*60;
+  for (int i = 0; i < TRIAL_SIZE; ++i) {
+    app->trial_onset_delays[i] = min_offset + rand() % 120;
+  }
+
+  app->trial_tags = "";
+}
+
+void app_write_reaction_times(App *app, FILE *fd, const char *timestamp) {
+  timestamp = timestamp ? timestamp : "(null)";
+  fprintf(fd, "i,timestamp,onset_delay_in_frames,reaction_time_in_frames,reaction_time_in_seconds,tags\n");
+  for (int i = 0; i < TRIAL_SIZE; ++i) {
+    fprintf(fd, "%02d,%s,%02d,%02d,%0.3f,%s\n", i, timestamp, app->trial_onset_delays[i],
+            app->trial_reaction_frames[i], app->trial_reaction_frames[i] * (1.0/60.0), app->trial_tags);
+  }
+}
+
+void app_write_reaction_times_to_path(App *app, char *path) {
+  #define PATH_BUFFER_SIZE 1024
+  #define DATE_BUFFER_SIZE 64
+  static char PATH_BUFFER[PATH_BUFFER_SIZE] = {0};
+  static char DATE_BUFFER[DATE_BUFFER_SIZE] = {0};
+  memset(PATH_BUFFER, 0, PATH_BUFFER_SIZE);
+  memset(DATE_BUFFER, 0, DATE_BUFFER_SIZE);
+
+  int i = 0;
+  for (; path[i]; ++i) {
+    if (i >= PATH_BUFFER_SIZE) DIE(NULL, "i >= PATH_BUFFER_SIZE");
+    if (path[i] == '/') {
+      if (mkdir(PATH_BUFFER, 0775) == -1 && errno != EEXIST) {
+        DIE(NULL, "mkdir");
+      }
+    }
+    PATH_BUFFER[i] = path[i];
+  }
+
+  time_t now_unix = time(NULL);
+  struct tm now = {0};
+  localtime_r(&now_unix, &now);
+
+  snprintf(DATE_BUFFER, DATE_BUFFER_SIZE, "%04d_%02d_%02d_%02d_%02d_%02d",
+                           now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec);
+  int suffix_size = snprintf(&PATH_BUFFER[i], PATH_BUFFER_SIZE - i, "_%s.csv", DATE_BUFFER);
+
+  if (i + suffix_size > PATH_BUFFER_SIZE) {
+    DIE(NULL, "snprintf: i + suffix_size > PATH_BUFFER_SIZE");
+  }
+  
+  FILE *f = fopen(PATH_BUFFER, "w");
+  if (!f) DIE(NULL, "fopen");
+  app_write_reaction_times(app, f, DATE_BUFFER);
+  fclose(f);
+
+  #undef PATH_BUFFER_SIZE
+  #undef DATE_BUFFER_SIZE
+}
 
 typedef struct Events {
   bool clicked;
@@ -121,74 +188,29 @@ void draw_rectangle(App *app, uint32_t *buf, int start_x, int start_y, int width
 }
 
 void render(App *app, uint32_t *buf, Events* events, int frame, float processing_dt) {
-  // Clear
-  // draw_rectangle(app, buf, 0, 0, app->width, app->height, app->stride, BLACK);
-  app->cursor = Cursor_Default;
+  int trial_frame = app->trial_reference_frame + app->trial_onset_delays[app->trial_index];
 
-  // Tear test
-  int stripes_speed = 3;
-  int stripes_width = 64;
-  for (int y = 0; y < app->height; y++) {
-    for (int x = 0; x < app->width; x++) {
-      int stripe_pos = (x + app->stripes_frame*stripes_speed) % (stripes_width*2);
-      uint32_t color = (stripe_pos < stripes_width) ? COLOR_STRIPE_A : COLOR_STRIPE_B;
-      buf[y*app->stride + x] = color;
-    }
+  if (frame == trial_frame) {
+    app->in_trial = true;
+    app->trial_reaction_frames[app->trial_index] = frame + 1; // frame displayed at the beginning of next frame
   }
-  int scan_line_y = (app->stripes_frame % 120)*app->height/120;
-  draw_rectangle(app, buf, 0, scan_line_y, app->width, 1, app->stride, COLOR_SCAN_LINE);
-  if (!app->paused) app->stripes_frame += 1;
 
-  // Frame dt graph
-  FRAME_DT_GRAPH[frame % FRAME_DT_GRAPH_SIZE] = processing_dt;
-
-  int frame_base_width = app->width / FRAME_DT_GRAPH_SIZE;
-  int rem_width = app->width % FRAME_DT_GRAPH_SIZE;
-
-  int FPS_AT_MAX_HEIGHT = 60;
-  int half_height = app->height / 2;
-
-  for (int y = 0; y < half_height; ++y) {
-    for (int frame_index=0, frame_start_x=0; frame_index < FRAME_DT_GRAPH_SIZE; ++frame_index) {
-
-      int frame_dt_index = (frame + 1 + frame_index) % FRAME_DT_GRAPH_SIZE;
-      int frame_height = FRAME_DT_GRAPH[frame_dt_index]*half_height*FPS_AT_MAX_HEIGHT;
-      if (frame_height > half_height) frame_height = half_height;
-
-      int frame_width_with_rem = frame_base_width + ((frame_index < rem_width) ? 1 : 0);
-
-      if (y >= (half_height - frame_height)) {
-        for (int x = frame_start_x; x < frame_start_x + frame_width_with_rem - 1; ++x) {
-          buf[y*app->stride + x] = COLOR_DT_GRAPH;
-        }
+  if (app->in_trial) {  
+    if (events->key == ' ') {
+      app->trial_reaction_frames[app->trial_index] = frame - app->trial_reaction_frames[app->trial_index];
+      app->in_trial = false;
+      app->trial_reference_frame = frame;
+      app->trial_index++;
+      if (app->trial_index >= TRIAL_SIZE) {
+        app->quit = true;
+        app_write_reaction_times(app, stderr, NULL);
+        app_write_reaction_times_to_path(app, "data/reaction_times");
       }
-
-      frame_start_x += frame_width_with_rem;
     }
   }
-
-  // Pause Button
-  int button_w = 80;
-  int button_h = 50;
-  int button_x = (app->width - button_w)/2;
-  int button_y = (app->height*3 - button_h*2)/4;
-  int button_color = COLOR_BUTTON;
-
-  if ((app->mouse_x >= button_x && app->mouse_x < (button_x + button_w)) &&
-      (app->mouse_y >= button_y && app->mouse_y < (button_y + button_h))) {
-    button_color = COLOR_BUTTON_HOVER;
-    app->cursor = Cursor_Pointer;
-    if (events->clicked) {
-      app->paused = !app->paused;
-    }
-  }
-
-  draw_rectangle(app, buf, button_x, button_y, button_w, button_h, app->stride, button_color);
-
-  // Pause Key
-  if (events->key == ' ') {
-    app->paused = !app->paused;
-  }
+  
+  int color = app->in_trial ? COLOR_BUTTON : COLOR_BLACK;
+  draw_rectangle(app, buf, 0, 0, app->width, app->height, app->stride, color);
 }
 
 const char* xcb_connect_error_to_string(int error_code) {
@@ -750,7 +772,6 @@ int main() {
   Cursor cursor = app.cursor;
 
   // Event loop state
-  bool quit = false;
   int current_buffer = 0;
   int frame_count = 0;
   float processing_dt = 0.0;
@@ -758,7 +779,9 @@ int main() {
   xcb_sync_int64_t pending_sync_value = zero_sync_value;
   xcb_sync_int64_t acknowledged_sync_value = zero_sync_value;
 
-  while (!quit) {
+  app_init(&app);
+
+  while (!app.quit) {
     struct timespec start_time = {0};
     struct timespec end_time = {0};
 
@@ -777,7 +800,7 @@ int main() {
         xcb_print_error(error);
         DIE(connection, "xcb_print_error");
       } else {
-        xcb_print_event(event);
+        // xcb_print_event(event);
         switch (event->response_type & 0x7F) {
           case XCB_CONFIGURE_NOTIFY: {
             const xcb_configure_notify_event_t *e = (const xcb_configure_notify_event_t *)event;
@@ -799,7 +822,7 @@ int main() {
             if (e->type == wm_protocols) {
               if(e->data.data32[0] == wm_delete_window) {
                 fprintf(stderr, "Received WM_DELETE_WINDOW, quitting...\n");
-                quit = true;
+                app.quit = true;
               } else if (e->data.data32[0] == wm_sync_request) {
                 pending_sync_value.lo = e->data.data32[2];
                 pending_sync_value.hi = e->data.data32[3];
@@ -913,7 +936,7 @@ int main() {
     ++frame_count;
     current_buffer = (current_buffer + 1) % BUFFER_COUNT;
   }
-  
+
   for (int i = 0; i < BUFFER_COUNT; ++i) {
     if (buffers[i]) munmap(buffers[i], size);
     if (udmabufs[i] >= 0) close(udmabufs[i]);
